@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 from time import perf_counter
 from typing import Annotated
 
+import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
@@ -162,8 +163,9 @@ def predict_samples(
     samples: list[PredictionRequest], bundle: ModelBundle
 ) -> list[PredictionResult]:
     values = prepare_samples(samples, bundle)
-    predictions = bundle.model.predict(values)
-    probabilities = bundle.model.predict_proba(values)[:, 1]
+    feature_frame = pd.DataFrame(values, columns=bundle.features)
+    predictions = bundle.model.predict(feature_frame)
+    probabilities = bundle.model.predict_proba(feature_frame)[:, 1]
 
     return [
         PredictionResult(

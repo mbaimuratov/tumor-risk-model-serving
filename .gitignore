@@ -32,3 +32,8 @@ models/
 artifacts/
 outputs/
 data/
+
+mlflow.db
+mlruns/
+
+plan.md
