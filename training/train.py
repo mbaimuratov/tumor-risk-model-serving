@@ -55,6 +55,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Search for a random forest model instead of the default logistic regression.",
     )
+    parser.add_argument(
+        "--select-best-run",
+        action="store_true",
+        help=(
+            "Search MLflow runs and select the best one by recall, then roc_auc, "
+            "then false_negative_rate."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -191,6 +199,54 @@ search_space = [
 ]
 
 
+def selection_key(metrics: dict[str, float]) -> tuple[float, float, float]:
+    return (
+        metrics["recall"],
+        metrics["roc_auc"],
+        -metrics["false_negative_rate"],
+    )
+
+
+def run_metrics_from_mlflow(run) -> dict[str, float] | None:
+    required_metrics = ("recall", "roc_auc", "false_negative_rate")
+    if not all(metric in run.data.metrics for metric in required_metrics):
+        return None
+    return {metric: run.data.metrics[metric] for metric in required_metrics}
+
+
+def select_best_run() -> None:
+    experiment = mlflow.get_experiment_by_name("tumor-risk-classifier")
+    if experiment is None:
+        raise RuntimeError("MLflow experiment 'tumor-risk-classifier' does not exist.")
+
+    runs = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        output_format="list",
+    )
+    if not runs:
+        raise RuntimeError("No MLflow runs have recall, roc_auc, and false_negative_rate.")
+
+    best_run = None
+    best_metrics = None
+    for run in runs:
+        metrics = run_metrics_from_mlflow(run)
+        if metrics is None:
+            continue
+        if best_metrics is None or selection_key(metrics) > selection_key(best_metrics):
+            best_run = run
+            best_metrics = metrics
+
+    if best_run is None or best_metrics is None:
+        raise RuntimeError("No eligible MLflow runs found for model selection.")
+
+    print("Selected best run:")
+    print(f"run_id={best_run.info.run_id}")
+    print(f"run_name={best_run.data.tags.get('mlflow.runName', '')}")
+    print(f"recall={best_metrics['recall']:.6f}")
+    print(f"roc_auc={best_metrics['roc_auc']:.6f}")
+    print(f"false_negative_rate={best_metrics['false_negative_rate']:.6f}")
+
+
 def run_random_forest_search() -> None:
     dataset = load_breast_cancer()
     features = dataset.feature_names.tolist()
@@ -262,13 +318,9 @@ def run_random_forest_search() -> None:
                 )
                 mlflow.log_metrics(metrics)
 
-                is_better = metrics["recall"] > best_score or (
-                    metrics["recall"] == best_score
-                    and (
-                        best_metrics is None
-                        or metrics["roc_auc"] > best_metrics["roc_auc"]
-                    )
-                )
+                is_better = best_metrics is None or selection_key(
+                    metrics
+                ) > selection_key(best_metrics)
                 if is_better:
                     best_score = metrics["recall"]
                     best_run_id = child_run.info.run_id
@@ -301,6 +353,10 @@ def main() -> None:
 
     if args.search_random_forest:
         run_random_forest_search()
+        return
+
+    if args.select_best_run:
+        select_best_run()
         return
 
     version = args.model_version
