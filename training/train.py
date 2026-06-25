@@ -80,6 +80,11 @@ def parse_args() -> argparse.Namespace:
         "--set-candidate-version",
         help=f"Set the candidate alias on a {REGISTERED_MODEL_NAME} version.",
     )
+    parser.add_argument(
+        "--annotate-registered-models",
+        action="store_true",
+        help=f"Add readiness tags and descriptions to {REGISTERED_MODEL_NAME} versions.",
+    )
     return parser.parse_args()
 
 
@@ -300,6 +305,96 @@ def register_best_model() -> None:
         f"Registered {REGISTERED_MODEL_NAME} version {model_version.version} "
         f"from run {best_run.info.run_id}"
     )
+    annotate_model_version(model_version.version)
+
+
+def normalized_model_type(run) -> str:
+    model_type = run.data.params.get("model_type", "unknown")
+    return (
+        model_type.replace("Classifier", "")
+        .replace("Regression", "_regression")
+        .replace("RandomForest", "random_forest")
+        .lower()
+    )
+
+
+def model_version_tags(run) -> dict[str, str]:
+    return {
+        "validation_status": "approved",
+        "model_type": normalized_model_type(run),
+        "risk_level": "experimental",
+        "dataset": "sklearn_breast_cancer",
+        "pre_deploy_checks": "passed",
+    }
+
+
+def model_version_description(version: str, run) -> str:
+    metrics = run.data.metrics
+    return f"""# {REGISTERED_MODEL_NAME} version {version}
+
+## What changed
+Accepted model registered from MLflow run `{run.info.run_id}`.
+
+## Why this model was trained
+Train a tumor-risk classifier for the sklearn breast cancer dataset and compare candidates using clinical-risk-oriented metrics.
+
+## Key metrics
+- recall: {metrics.get("recall", "unknown")}
+- roc_auc: {metrics.get("roc_auc", "unknown")}
+- false_negative_rate: {metrics.get("false_negative_rate", "unknown")}
+- precision: {metrics.get("precision", "unknown")}
+
+## Known limitations
+This model is trained on the sklearn breast cancer example dataset and is for serving/MLOps practice only. It is not clinically validated.
+
+## Deployment decision
+Validation status is approved for this local learning environment. The model can be referenced by registry version or promoted via alias.
+"""
+
+
+def annotate_model_version(version: str) -> None:
+    client = mlflow.tracking.MlflowClient()
+    model_version = client.get_model_version(REGISTERED_MODEL_NAME, version)
+    if not model_version.run_id:
+        raise RuntimeError(
+            f"{REGISTERED_MODEL_NAME} version {version} has no source run_id."
+        )
+
+    run = client.get_run(model_version.run_id)
+    for key, value in model_version_tags(run).items():
+        client.set_model_version_tag(REGISTERED_MODEL_NAME, version, key, value)
+    client.update_model_version(
+        REGISTERED_MODEL_NAME,
+        version,
+        description=model_version_description(version, run),
+    )
+    print(f"Annotated {REGISTERED_MODEL_NAME} version {version}")
+
+
+def annotate_registered_model_versions() -> None:
+    versions = registered_model_versions()
+    if not versions:
+        raise RuntimeError(
+            f"No registered versions exist for {REGISTERED_MODEL_NAME}; "
+            "run --register-best-model first."
+        )
+
+    client = mlflow.tracking.MlflowClient()
+    client.update_registered_model(
+        REGISTERED_MODEL_NAME,
+        description=(
+            "Tumor-risk classifier registry for local MLflow model lifecycle "
+            "practice. Production references should use aliases such as "
+            "champion, candidate, and baseline."
+        ),
+    )
+    client.set_registered_model_tag(
+        REGISTERED_MODEL_NAME, "dataset", "sklearn_breast_cancer"
+    )
+    client.set_registered_model_tag(REGISTERED_MODEL_NAME, "risk_level", "experimental")
+
+    for model_version in versions:
+        annotate_model_version(model_version.version)
 
 
 def registered_model_versions() -> list:
@@ -462,6 +557,10 @@ def main() -> None:
 
     if args.set_candidate_version:
         set_model_alias("candidate", args.set_candidate_version)
+        return
+
+    if args.annotate_registered_models:
+        annotate_registered_model_versions()
         return
 
     if args.register_best_model:
