@@ -36,7 +36,7 @@ from sklearn.preprocessing import StandardScaler
 RANDOM_STATE = 42
 TEST_SIZE = 0.2
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-REGISTERED_MODEL_NAME = "tumor-risk-classifier"
+REGISTERED_MODEL_NAME = "TumorRiskClassifier"
 SUPPORTED_VERSIONS = ("v1", "v2")
 
 mlflow.set_experiment("tumor-risk-classifier")
@@ -62,6 +62,23 @@ def parse_args() -> argparse.Namespace:
             "Search MLflow runs and select the best one by recall, then roc_auc, "
             "then false_negative_rate."
         ),
+    )
+    parser.add_argument(
+        "--register-best-model",
+        action="store_true",
+        help=f"Register the selected best MLflow model as {REGISTERED_MODEL_NAME}.",
+    )
+    parser.add_argument(
+        "--set-default-aliases",
+        action="store_true",
+        help=(
+            "Set baseline to the oldest registered version and champion to the "
+            "latest registered version."
+        ),
+    )
+    parser.add_argument(
+        "--set-candidate-version",
+        help=f"Set the candidate alias on a {REGISTERED_MODEL_NAME} version.",
     )
     return parser.parse_args()
 
@@ -214,7 +231,7 @@ def run_metrics_from_mlflow(run) -> dict[str, float] | None:
     return {metric: run.data.metrics[metric] for metric in required_metrics}
 
 
-def select_best_run() -> None:
+def select_best_run():
     experiment = mlflow.get_experiment_by_name("tumor-risk-classifier")
     if experiment is None:
         raise RuntimeError("MLflow experiment 'tumor-risk-classifier' does not exist.")
@@ -245,6 +262,70 @@ def select_best_run() -> None:
     print(f"recall={best_metrics['recall']:.6f}")
     print(f"roc_auc={best_metrics['roc_auc']:.6f}")
     print(f"false_negative_rate={best_metrics['false_negative_rate']:.6f}")
+    return best_run, best_metrics
+
+
+def logged_model_for_run(run_id: str):
+    client = mlflow.tracking.MlflowClient()
+    experiment = mlflow.get_experiment_by_name("tumor-risk-classifier")
+    if experiment is None:
+        raise RuntimeError("MLflow experiment 'tumor-risk-classifier' does not exist.")
+
+    logged_models = client.search_logged_models([experiment.experiment_id])
+    matching_models = [
+        model
+        for model in logged_models
+        if model.source_run_id == run_id and model.name == "model"
+    ]
+    if not matching_models:
+        raise RuntimeError(f"Selected run {run_id} has no logged MLflow model artifact.")
+    return max(matching_models, key=lambda model: model.creation_timestamp)
+
+
+def register_best_model() -> None:
+    best_run, best_metrics = select_best_run()
+    logged_model = logged_model_for_run(best_run.info.run_id)
+    model_version = mlflow.register_model(
+        logged_model.model_uri,
+        REGISTERED_MODEL_NAME,
+        tags={
+            "selected_from_run_id": best_run.info.run_id,
+            "selection_rule": "highest_recall_then_roc_auc_then_lowest_false_negative_rate",
+            "recall": f"{best_metrics['recall']:.6f}",
+            "roc_auc": f"{best_metrics['roc_auc']:.6f}",
+            "false_negative_rate": f"{best_metrics['false_negative_rate']:.6f}",
+        },
+    )
+    print(
+        f"Registered {REGISTERED_MODEL_NAME} version {model_version.version} "
+        f"from run {best_run.info.run_id}"
+    )
+
+
+def registered_model_versions() -> list:
+    client = mlflow.tracking.MlflowClient()
+    versions = client.search_model_versions(f"name = '{REGISTERED_MODEL_NAME}'")
+    return sorted(versions, key=lambda model_version: int(model_version.version))
+
+
+def set_model_alias(alias: str, version: str) -> None:
+    client = mlflow.tracking.MlflowClient()
+    client.set_registered_model_alias(REGISTERED_MODEL_NAME, alias, version)
+    print(f"Set alias {REGISTERED_MODEL_NAME}@{alias} -> version {version}")
+
+
+def set_default_aliases() -> None:
+    versions = registered_model_versions()
+    if not versions:
+        raise RuntimeError(
+            f"No registered versions exist for {REGISTERED_MODEL_NAME}; "
+            "run --register-best-model first."
+        )
+
+    baseline_version = versions[0].version
+    champion_version = versions[-1].version
+    set_model_alias("baseline", baseline_version)
+    set_model_alias("champion", champion_version)
 
 
 def run_random_forest_search() -> None:
@@ -297,6 +378,16 @@ def run_random_forest_search() -> None:
                 model.fit(x_train_frame, y_train)
                 predictions = model.predict(x_test_frame)
                 probabilities = model.predict_proba(x_test_frame)[:, 1]
+                input_example = x_test_frame.head(1)
+                signature = infer_signature(
+                    input_example,
+                    {
+                        "prediction": model.predict(input_example),
+                        "malignant_probability": model.predict_proba(input_example)[
+                            :, 1
+                        ],
+                    },
+                )
                 metrics = {
                     "accuracy": accuracy_score(y_test, predictions),
                     "precision": precision_score(y_test, predictions),
@@ -317,6 +408,16 @@ def run_random_forest_search() -> None:
                     }
                 )
                 mlflow.log_metrics(metrics)
+                mlflow.sklearn.log_model(
+                    sk_model=model,
+                    name="model",
+                    input_example=input_example,
+                    signature=signature,
+                    metadata={
+                        "algorithm": "RandomForestClassifier",
+                        "search_type": "manual_grid_search",
+                    },
+                )
 
                 is_better = best_metrics is None or selection_key(
                     metrics
@@ -353,6 +454,18 @@ def main() -> None:
 
     if args.search_random_forest:
         run_random_forest_search()
+        return
+
+    if args.set_default_aliases:
+        set_default_aliases()
+        return
+
+    if args.set_candidate_version:
+        set_model_alias("candidate", args.set_candidate_version)
+        return
+
+    if args.register_best_model:
+        register_best_model()
         return
 
     if args.select_best_run:
@@ -442,7 +555,6 @@ def main() -> None:
             name="model",
             input_example=input_example,
             signature=signature,
-            registered_model_name=REGISTERED_MODEL_NAME,
             metadata={
                 "model_version": version,
                 "algorithm": algorithm,
