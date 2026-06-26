@@ -14,7 +14,7 @@ import mlflow.sklearn
 import joblib
 import matplotlib.pyplot as plt
 import pandas as pd
-from mlflow.models import infer_signature
+from mlflow.models import Model, infer_signature
 from sklearn.datasets import load_breast_cancer
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.linear_model import LogisticRegression
@@ -79,6 +79,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--set-candidate-version",
         help=f"Set the candidate alias on a {REGISTERED_MODEL_NAME} version.",
+    )
+    parser.add_argument(
+        "--promote-candidate",
+        action="store_true",
+        help=(
+            "Validate the candidate alias against the current champion and promote "
+            "candidate to champion only if all checks pass."
+        ),
     )
     parser.add_argument(
         "--annotate-registered-models",
@@ -409,6 +417,126 @@ def set_model_alias(alias: str, version: str) -> None:
     print(f"Set alias {REGISTERED_MODEL_NAME}@{alias} -> version {version}")
 
 
+def model_version_by_alias(alias: str):
+    client = mlflow.tracking.MlflowClient()
+    try:
+        return client.get_model_version_by_alias(REGISTERED_MODEL_NAME, alias)
+    except Exception as exc:
+        raise RuntimeError(
+            f"Could not resolve {REGISTERED_MODEL_NAME}@{alias}; set the alias first."
+        ) from exc
+
+
+def model_version_run_metrics(model_version) -> dict[str, float]:
+    if not model_version.run_id:
+        raise RuntimeError(
+            f"{REGISTERED_MODEL_NAME} version {model_version.version} has no run_id."
+        )
+
+    run = mlflow.tracking.MlflowClient().get_run(model_version.run_id)
+    required_metrics = ("recall", "false_negative_rate")
+    missing_metrics = [
+        metric for metric in required_metrics if metric not in run.data.metrics
+    ]
+    if missing_metrics:
+        raise RuntimeError(
+            f"{REGISTERED_MODEL_NAME} version {model_version.version} is missing "
+            f"metrics: {', '.join(missing_metrics)}"
+        )
+    return {metric: run.data.metrics[metric] for metric in required_metrics}
+
+
+def validate_model_artifacts(version: str) -> None:
+    model_uri = f"models:/{REGISTERED_MODEL_NAME}/{version}"
+    mlflow_model = Model.load(model_uri)
+    if mlflow_model.signature is None or mlflow_model.signature.inputs is None:
+        raise RuntimeError(f"{model_uri} has no input signature.")
+
+    input_example_info = getattr(mlflow_model, "saved_input_example_info", None)
+    if not input_example_info:
+        raise RuntimeError(f"{model_uri} has no saved input example.")
+
+    mlflow.sklearn.load_model(model_uri)
+
+
+def validate_candidate_metrics(candidate_version, champion_version) -> None:
+    candidate_metrics = model_version_run_metrics(candidate_version)
+    champion_metrics = model_version_run_metrics(champion_version)
+
+    if candidate_metrics["recall"] < champion_metrics["recall"]:
+        raise RuntimeError(
+            "Candidate recall "
+            f"{candidate_metrics['recall']:.6f} is lower than champion recall "
+            f"{champion_metrics['recall']:.6f}."
+        )
+    if (
+        candidate_metrics["false_negative_rate"]
+        > champion_metrics["false_negative_rate"]
+    ):
+        raise RuntimeError(
+            "Candidate false_negative_rate "
+            f"{candidate_metrics['false_negative_rate']:.6f} is higher than "
+            "champion false_negative_rate "
+            f"{champion_metrics['false_negative_rate']:.6f}."
+        )
+
+
+def run_candidate_predict_smoke_test(version: str) -> None:
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    dataset = load_breast_cancer()
+    payload = {
+        "features": dict(
+            zip(
+                dataset.feature_names.tolist(),
+                dataset.data[0].tolist(),
+                strict=True,
+            )
+        )
+    }
+    model_uri = f"models:/{REGISTERED_MODEL_NAME}/{version}"
+    previous_model_uri = os.environ.get("MODEL_URI")
+    os.environ["MODEL_URI"] = model_uri
+    try:
+        with TestClient(app) as test_client:
+            response = test_client.post("/predict", json=payload)
+    finally:
+        if previous_model_uri is None:
+            os.environ.pop("MODEL_URI", None)
+        else:
+            os.environ["MODEL_URI"] = previous_model_uri
+
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"/predict smoke test failed for {model_uri}: "
+            f"{response.status_code} {response.text}"
+        )
+
+
+def promote_candidate_to_champion() -> None:
+    candidate_version = model_version_by_alias("candidate")
+    champion_version = model_version_by_alias("champion")
+
+    try:
+        validate_model_artifacts(candidate_version.version)
+        validate_candidate_metrics(candidate_version, champion_version)
+        run_candidate_predict_smoke_test(candidate_version.version)
+    except Exception as exc:
+        print(
+            f"Pre-deployment validation failed; kept {REGISTERED_MODEL_NAME}@champion "
+            f"on version {champion_version.version}. Reason: {exc}"
+        )
+        raise
+
+    set_model_alias("champion", candidate_version.version)
+    print(
+        f"Promoted {REGISTERED_MODEL_NAME}@candidate version "
+        f"{candidate_version.version} to champion."
+    )
+
+
 def set_default_aliases() -> None:
     versions = registered_model_versions()
     if not versions:
@@ -557,6 +685,10 @@ def main() -> None:
 
     if args.set_candidate_version:
         set_model_alias("candidate", args.set_candidate_version)
+        return
+
+    if args.promote_candidate:
+        promote_candidate_to_champion()
         return
 
     if args.annotate_registered_models:
