@@ -37,7 +37,8 @@ from app.schemas import (
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     version = os.getenv("MODEL_VERSION", "v1")
-    app.state.model_registry = ModelRegistry(version)
+    model_uri = os.getenv("MODEL_URI")
+    app.state.model_registry = ModelRegistry(version, model_uri=model_uri)
     register_model_info(app.state.model_registry.get())
     yield
     del app.state.model_registry
@@ -56,8 +57,10 @@ async def log_prediction_requests(request: Request, call_next):
     timestamp = utc_timestamp()
     request_id = get_request_id(request.headers.get("X-Request-ID"))
     registry = getattr(request.app.state, "model_registry", None)
-    request.state.model_version = request.query_params.get("model_version") or getattr(
-        registry, "default_version", None
+    request.state.model_version = (
+        request.query_params.get("model_version")
+        or getattr(registry, "model_uri", None)
+        or getattr(registry, "default_version", None)
     )
     request.state.prediction = None
     request.state.probability = None

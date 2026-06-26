@@ -5,8 +5,12 @@ services:
       dockerfile: docker/Dockerfile
     environment:
       MODEL_VERSION: ${MODEL_VERSION:-v1}
+      MODEL_URI: ${MODEL_URI:-}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-}
     ports:
       - "8000:8000"
+    volumes:
+      - ./mlruns:/Users/mac/vs_projects/personal/bio/tumor-risk-model-serving/mlruns
     restart: unless-stopped
     healthcheck:
       test:

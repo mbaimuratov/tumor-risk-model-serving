@@ -1,12 +1,15 @@
 import json
 import logging
+from types import SimpleNamespace
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 from sklearn.datasets import load_breast_cancer
 
 from app.main import app
+import app.model_loader as model_loader
 from app.model_loader import ModelLoadError, load_model
 from app.request_logging import prediction_logger
 
@@ -171,3 +174,70 @@ def test_model_version_config_selects_default(
 
     assert response.status_code == 200
     assert response.json()["model_version"] == "v2"
+
+
+def test_model_uri_config_loads_mlflow_model(
+    monkeypatch: pytest.MonkeyPatch,
+    sample: dict[str, dict[str, float]],
+) -> None:
+    features = list(sample["features"])
+
+    class FakeClient:
+        def get_model_version_by_alias(self, name: str, alias: str):
+            assert name == "TumorRiskClassifier"
+            assert alias == "champion"
+            return SimpleNamespace(version="7", run_id="run-123")
+
+        def get_run(self, run_id: str):
+            assert run_id == "run-123"
+            return SimpleNamespace(
+                data=SimpleNamespace(
+                    params={"model_type": "LogisticRegression"},
+                    metrics={
+                        "accuracy": 0.98,
+                        "precision": 0.97,
+                        "recall": 0.96,
+                        "roc_auc": 0.99,
+                    },
+                )
+            )
+
+    class FakeSignatureInput:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class FakeMlflowModel:
+        metadata = {"algorithm": "LogisticRegression"}
+        signature = SimpleNamespace(
+            inputs=SimpleNamespace(
+                inputs=[FakeSignatureInput(feature) for feature in features]
+            )
+        )
+
+    class FakeSklearnModel:
+        def predict(self, frame):
+            return np.ones(len(frame), dtype=int)
+
+        def predict_proba(self, frame):
+            return np.array([[0.1, 0.9]] * len(frame))
+
+    monkeypatch.setenv("MODEL_URI", "models:/TumorRiskClassifier@champion")
+    monkeypatch.setattr(model_loader, "MlflowClient", FakeClient)
+    monkeypatch.setattr(model_loader.Model, "load", lambda uri: FakeMlflowModel())
+    monkeypatch.setattr(
+        model_loader.mlflow.sklearn,
+        "load_model",
+        lambda uri: FakeSklearnModel(),
+    )
+
+    with TestClient(app) as test_client:
+        health_response = test_client.get("/health")
+        info_response = test_client.get("/model-info")
+        predict_response = test_client.post("/predict", json=sample)
+
+    assert health_response.status_code == 200
+    assert health_response.json()["model_version"] == "champion"
+    assert info_response.status_code == 200
+    assert info_response.json()["metrics"]["recall"] == 0.96
+    assert predict_response.status_code == 200
+    assert predict_response.json()["model_version"] == "champion"

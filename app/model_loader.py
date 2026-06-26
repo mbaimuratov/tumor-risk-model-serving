@@ -10,11 +10,15 @@ from threading import Lock
 from typing import Any
 
 import joblib
+import mlflow.sklearn
+from mlflow.models import Model
+from mlflow.tracking import MlflowClient
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 MODELS_ROOT = REPOSITORY_ROOT / "models"
 VERSION_PATTERN = re.compile(r"v[1-9][0-9]*")
+MLFLOW_MODEL_URI_PATTERN = re.compile(r"^models:/([^/@]+)(?:@([^/]+)|/([^/]+))$")
 REQUIRED_METADATA_FIELDS = {
     "model_version",
     "training_date",
@@ -47,6 +51,10 @@ class ModelBundle:
     @property
     def features(self) -> list[str]:
         return self.metadata["features"]
+
+    @property
+    def source(self) -> str:
+        return self.metadata.get("model_source", "local")
 
 
 def load_model(
@@ -118,18 +126,126 @@ def load_model(
     return ModelBundle(model=model, metadata=metadata)
 
 
+def parse_registered_model_uri(model_uri: str) -> tuple[str, str | None, str | None]:
+    match = MLFLOW_MODEL_URI_PATTERN.fullmatch(model_uri)
+    if not match:
+        raise ModelLoadError(
+            "MODEL_URI must use a registered MLflow model URI such as "
+            "'models:/TumorRiskClassifier@champion' or 'models:/TumorRiskClassifier/2'."
+        )
+    return match.group(1), match.group(2), match.group(3)
+
+
+def registered_model_metadata(model_uri: str) -> dict[str, Any]:
+    model_name, alias, version = parse_registered_model_uri(model_uri)
+    client = MlflowClient()
+    try:
+        model_version = (
+            client.get_model_version_by_alias(model_name, alias)
+            if alias is not None
+            else client.get_model_version(model_name, version)
+        )
+    except Exception as exc:
+        raise ModelLoadError(f"Could not resolve MLflow model URI {model_uri!r}: {exc}") from exc
+
+    run = None
+    if model_version.run_id:
+        try:
+            run = client.get_run(model_version.run_id)
+        except Exception as exc:
+            raise ModelLoadError(
+                f"Could not load MLflow run metadata for {model_uri!r}: {exc}"
+            ) from exc
+
+    return {
+        "registered_model_name": model_name,
+        "registered_model_alias": alias,
+        "registered_model_version": model_version.version,
+        "run_id": model_version.run_id,
+        "algorithm": (run.data.params.get("model_type") if run is not None else None),
+        "metrics": run.data.metrics if run is not None else {},
+    }
+
+
+def load_mlflow_model(model_uri: str) -> ModelBundle:
+    registry_metadata = registered_model_metadata(model_uri)
+    try:
+        mlflow_model = Model.load(model_uri)
+        model = mlflow.sklearn.load_model(model_uri)
+    except Exception as exc:
+        raise ModelLoadError(f"Could not load MLflow model at {model_uri!r}: {exc}") from exc
+
+    if mlflow_model.signature is None or mlflow_model.signature.inputs is None:
+        raise ModelLoadError("MLflow model must include an input signature.")
+
+    features = [column.name for column in mlflow_model.signature.inputs.inputs]
+    if (
+        not features
+        or not all(isinstance(name, str) and name for name in features)
+        or len(features) != len(set(features))
+    ):
+        raise ModelLoadError("MLflow model signature must include unique feature names.")
+
+    if not callable(getattr(model, "predict", None)) or not callable(
+        getattr(model, "predict_proba", None)
+    ):
+        raise ModelLoadError("MLflow model must implement predict() and predict_proba().")
+
+    metrics = registry_metadata["metrics"]
+    metadata = {
+        "model_source": "mlflow",
+        "model_uri": model_uri,
+        "model_version": (
+            registry_metadata["registered_model_alias"]
+            or registry_metadata["registered_model_version"]
+        ),
+        "registered_model_name": registry_metadata["registered_model_name"],
+        "registered_model_alias": registry_metadata["registered_model_alias"],
+        "registered_model_version": registry_metadata["registered_model_version"],
+        "run_id": registry_metadata["run_id"],
+        "algorithm": (
+            registry_metadata["algorithm"]
+            or (mlflow_model.metadata or {}).get("algorithm")
+            or "unknown"
+        ),
+        "features": features,
+        "accuracy": metrics.get("accuracy"),
+        "precision": metrics.get("precision"),
+        "recall": metrics.get("recall"),
+        "roc_auc": metrics.get("roc_auc"),
+    }
+    return ModelBundle(model=model, metadata=metadata)
+
+
 class ModelRegistry:
     """Load the configured model eagerly and cache query-selected versions."""
 
-    def __init__(self, default_version: str, models_root: Path = MODELS_ROOT) -> None:
+    def __init__(
+        self,
+        default_version: str,
+        models_root: Path = MODELS_ROOT,
+        model_uri: str | None = None,
+    ) -> None:
         self.default_version = default_version
         self.models_root = models_root
+        self.model_uri = model_uri
         self._lock = Lock()
-        self._models = {
-            default_version: load_model(default_version, models_root=models_root)
-        }
+        if model_uri:
+            self._models = {model_uri: load_mlflow_model(model_uri)}
+        else:
+            self._models = {
+                default_version: load_model(default_version, models_root=models_root)
+            }
 
     def get(self, version: str | None = None) -> ModelBundle:
+        if self.model_uri:
+            if version is not None:
+                raise ModelLoadError(
+                    "model_version query overrides are only supported for local models; "
+                    "set MODEL_URI to choose the MLflow model served by this API."
+                )
+            return self._models[self.model_uri]
+
         selected_version = version or self.default_version
         with self._lock:
             if selected_version not in self._models:
