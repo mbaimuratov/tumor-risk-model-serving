@@ -164,7 +164,15 @@ def registered_model_metadata(model_uri: str) -> dict[str, Any]:
         "run_id": model_version.run_id,
         "algorithm": (run.data.params.get("model_type") if run is not None else None),
         "metrics": run.data.metrics if run is not None else {},
+        "training_timestamp": run.info.start_time if run is not None else None,
     }
+
+
+def mlflow_signature_to_dict(mlflow_model: Model) -> dict[str, Any]:
+    signature = mlflow_model.signature
+    if signature is None:
+        return {}
+    return signature.to_dict()
 
 
 def load_mlflow_model(model_uri: str) -> ModelBundle:
@@ -203,12 +211,14 @@ def load_mlflow_model(model_uri: str) -> ModelBundle:
         "registered_model_alias": registry_metadata["registered_model_alias"],
         "registered_model_version": registry_metadata["registered_model_version"],
         "run_id": registry_metadata["run_id"],
+        "training_timestamp": registry_metadata["training_timestamp"],
         "algorithm": (
             registry_metadata["algorithm"]
             or (mlflow_model.metadata or {}).get("algorithm")
             or "unknown"
         ),
         "features": features,
+        "signature": mlflow_signature_to_dict(mlflow_model),
         "accuracy": metrics.get("accuracy"),
         "precision": metrics.get("precision"),
         "recall": metrics.get("recall"),

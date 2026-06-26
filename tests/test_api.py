@@ -191,6 +191,7 @@ def test_model_uri_config_loads_mlflow_model(
         def get_run(self, run_id: str):
             assert run_id == "run-123"
             return SimpleNamespace(
+                info=SimpleNamespace(start_time=1782396968225),
                 data=SimpleNamespace(
                     params={"model_type": "LogisticRegression"},
                     metrics={
@@ -209,9 +210,19 @@ def test_model_uri_config_loads_mlflow_model(
     class FakeMlflowModel:
         metadata = {"algorithm": "LogisticRegression"}
         signature = SimpleNamespace(
-            inputs=SimpleNamespace(
-                inputs=[FakeSignatureInput(feature) for feature in features]
-            )
+            inputs=SimpleNamespace(inputs=[FakeSignatureInput(feature) for feature in features]),
+            to_dict=lambda: {
+                "inputs": json.dumps(
+                    [{"name": feature, "type": "double"} for feature in features]
+                ),
+                "outputs": json.dumps(
+                    [
+                        {"name": "prediction", "type": "long"},
+                        {"name": "malignant_probability", "type": "double"},
+                    ]
+                ),
+                "params": None,
+            },
         )
 
     class FakeSklearnModel:
@@ -238,6 +249,16 @@ def test_model_uri_config_loads_mlflow_model(
     assert health_response.status_code == 200
     assert health_response.json()["model_version"] == "champion"
     assert info_response.status_code == 200
-    assert info_response.json()["metrics"]["recall"] == 0.96
+    info = info_response.json()
+    assert info["model_uri"] == "models:/TumorRiskClassifier@champion"
+    assert info["registered_model_name"] == "TumorRiskClassifier"
+    assert info["model_version"] == "7"
+    assert info["alias"] == "champion"
+    assert info["run_id"] == "run-123"
+    assert info["algorithm"] == "LogisticRegression"
+    assert info["metrics"]["recall"] == 0.96
+    assert info["features"] == features
+    assert set(info["signature"]) == {"inputs", "outputs", "params"}
+    assert info["training_timestamp"] == 1782396968225
     assert predict_response.status_code == 200
     assert predict_response.json()["model_version"] == "champion"

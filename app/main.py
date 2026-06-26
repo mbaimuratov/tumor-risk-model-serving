@@ -197,16 +197,31 @@ def model_info(
 ) -> dict[str, object]:
     bundle = get_model_bundle(request, model_version)
     metadata = bundle.metadata
+    metrics = {
+        "accuracy": metadata["accuracy"],
+        "precision": metadata["precision"],
+        "recall": metadata["recall"],
+        "roc_auc": metadata["roc_auc"],
+    }
+    if bundle.source == "mlflow":
+        return {
+            "model_uri": metadata["model_uri"],
+            "registered_model_name": metadata["registered_model_name"],
+            "model_version": metadata["registered_model_version"],
+            "alias": metadata["registered_model_alias"],
+            "run_id": metadata["run_id"],
+            "algorithm": metadata["algorithm"],
+            "metrics": metrics,
+            "features": bundle.features,
+            "signature": metadata["signature"],
+            "training_timestamp": metadata["training_timestamp"],
+        }
+
     return {
         "model_version": bundle.version,
         "algorithm": metadata["algorithm"],
         "features": bundle.features,
-        "metrics": {
-            "accuracy": metadata["accuracy"],
-            "precision": metadata["precision"],
-            "recall": metadata["recall"],
-            "roc_auc": metadata["roc_auc"],
-        },
+        "metrics": metrics,
     }
 
 
