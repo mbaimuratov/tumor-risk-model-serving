@@ -13,15 +13,21 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from app.metrics import record_prediction_metrics, register_model_info
+from app.metrics import (
+    record_prediction_metrics,
+    record_shadow_metrics,
+    register_model_info,
+)
 from app.model_loader import (
     ModelArtifactMissingError,
     ModelBundle,
     ModelLoadError,
+    parse_registered_model_uri,
     ModelRegistry,
 )
 from app.request_logging import (
     get_request_id,
+    log_shadow_prediction,
     log_prediction_request,
     utc_timestamp,
 )
@@ -62,6 +68,8 @@ async def log_prediction_requests(request: Request, call_next):
         or getattr(registry, "model_uri", None)
         or getattr(registry, "default_version", None)
     )
+    request.state.request_id = request_id
+    request.state.timestamp = timestamp
     request.state.prediction = None
     request.state.probability = None
 
@@ -133,6 +141,32 @@ def get_model_bundle(
     return bundle
 
 
+def get_shadow_model_uri(request: Request) -> str | None:
+    registry = getattr(request.app.state, "model_registry", None)
+    if registry is None or not getattr(registry, "model_uri", None):
+        return None
+
+    configured_uri = os.getenv("SHADOW_MODEL_URI")
+    if configured_uri:
+        return configured_uri
+
+    try:
+        model_name, alias, version = parse_registered_model_uri(registry.model_uri)
+    except ModelLoadError:
+        return None
+    if alias != "champion" or version is not None:
+        return None
+    return f"models:/{model_name}@candidate"
+
+
+def get_shadow_model_bundle(request: Request) -> ModelBundle | None:
+    registry = getattr(request.app.state, "model_registry", None)
+    shadow_model_uri = get_shadow_model_uri(request)
+    if registry is None or shadow_model_uri is None:
+        return None
+    return registry.get_model_uri(shadow_model_uri)
+
+
 def prepare_samples(
     samples: list[PredictionRequest], bundle: ModelBundle
 ) -> list[list[float]]:
@@ -178,6 +212,79 @@ def predict_samples(
         )
         for prediction, probability in zip(predictions, probabilities, strict=True)
     ]
+
+
+def run_shadow_prediction(
+    *,
+    request: Request,
+    payload: PredictionRequest,
+    champion_bundle: ModelBundle,
+    champion_result: PredictionResult,
+    latency_champion_ms: float,
+) -> None:
+    timestamp = getattr(request.state, "timestamp", utc_timestamp())
+    request_id = getattr(request.state, "request_id", get_request_id(None))
+    candidate_bundle = None
+    candidate_result = None
+    latency_candidate_ms = None
+    candidate_error = None
+
+    candidate_started_at = perf_counter()
+    try:
+        candidate_bundle = get_shadow_model_bundle(request)
+        if candidate_bundle is None:
+            return
+        candidate_result = predict_samples([payload], candidate_bundle)[0]
+        latency_candidate_ms = (perf_counter() - candidate_started_at) * 1_000
+    except Exception as exc:
+        latency_candidate_ms = (perf_counter() - candidate_started_at) * 1_000
+        candidate_error = str(exc)
+
+    if candidate_bundle is not None and candidate_result is not None:
+        disagreement = champion_result.prediction != candidate_result.prediction
+        probability_delta = abs(
+            champion_result.malignant_probability
+            - candidate_result.malignant_probability
+        )
+        record_shadow_metrics(
+            champion_model_version=champion_bundle.version,
+            candidate_model_version=candidate_bundle.version,
+            disagreement=disagreement,
+            probability_delta=probability_delta,
+        )
+        log_shadow_prediction(
+            timestamp=timestamp,
+            request_id=request_id,
+            champion_model_version=champion_bundle.version,
+            candidate_model_version=candidate_bundle.version,
+            champion_prediction=champion_result.prediction,
+            candidate_prediction=candidate_result.prediction,
+            champion_probability=champion_result.malignant_probability,
+            candidate_probability=candidate_result.malignant_probability,
+            disagreement=disagreement,
+            probability_delta=probability_delta,
+            latency_champion_ms=latency_champion_ms,
+            latency_candidate_ms=latency_candidate_ms,
+        )
+        return
+
+    log_shadow_prediction(
+        timestamp=timestamp,
+        request_id=request_id,
+        champion_model_version=champion_bundle.version,
+        candidate_model_version=(
+            candidate_bundle.version if candidate_bundle is not None else None
+        ),
+        champion_prediction=champion_result.prediction,
+        candidate_prediction=None,
+        champion_probability=champion_result.malignant_probability,
+        candidate_probability=None,
+        disagreement=None,
+        probability_delta=None,
+        latency_champion_ms=latency_champion_ms,
+        latency_candidate_ms=latency_candidate_ms,
+        candidate_error=candidate_error or "candidate model is not configured",
+    )
 
 
 @app.get("/health")
@@ -232,9 +339,19 @@ def predict(
     model_version: ModelVersionQuery = None,
 ) -> PredictionResponse:
     bundle = get_model_bundle(request, model_version)
+    champion_started_at = perf_counter()
     result = predict_samples([payload], bundle)[0]
+    latency_champion_ms = (perf_counter() - champion_started_at) * 1_000
     request.state.prediction = result.prediction
     request.state.probability = result.malignant_probability
+    if model_version is None:
+        run_shadow_prediction(
+            request=request,
+            payload=payload,
+            champion_bundle=bundle,
+            champion_result=result,
+            latency_champion_ms=latency_champion_ms,
+        )
     return PredictionResponse(model_version=bundle.version, **result.model_dump())
 
 

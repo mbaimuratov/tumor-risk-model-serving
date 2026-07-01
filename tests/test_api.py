@@ -11,7 +11,7 @@ from sklearn.datasets import load_breast_cancer
 from app.main import app
 import app.model_loader as model_loader
 from app.model_loader import ModelLoadError, load_model
-from app.request_logging import prediction_logger
+from app.request_logging import prediction_logger, shadow_logger
 
 
 @pytest.fixture
@@ -262,3 +262,170 @@ def test_model_uri_config_loads_mlflow_model(
     assert info["training_timestamp"] == 1782396968225
     assert predict_response.status_code == 200
     assert predict_response.json()["model_version"] == "champion"
+
+
+def test_predict_shadows_candidate_without_exposing_result(
+    monkeypatch: pytest.MonkeyPatch,
+    sample: dict[str, dict[str, float]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    features = list(sample["features"])
+
+    class FakeClient:
+        def get_model_version_by_alias(self, name: str, alias: str):
+            assert name == "TumorRiskClassifier"
+            return SimpleNamespace(
+                version={"champion": "10", "candidate": "11"}[alias],
+                run_id=f"run-{alias}",
+            )
+
+        def get_run(self, run_id: str):
+            return SimpleNamespace(
+                info=SimpleNamespace(start_time=1782396968225),
+                data=SimpleNamespace(
+                    params={"model_type": "LogisticRegression"},
+                    metrics={
+                        "accuracy": 0.98,
+                        "precision": 0.97,
+                        "recall": 0.96,
+                        "roc_auc": 0.99,
+                    },
+                ),
+            )
+
+    class FakeSignatureInput:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class FakeMlflowModel:
+        metadata = {"algorithm": "LogisticRegression"}
+        signature = SimpleNamespace(
+            inputs=SimpleNamespace(
+                inputs=[FakeSignatureInput(feature) for feature in features]
+            ),
+            to_dict=lambda: {"inputs": "[]", "outputs": "[]", "params": None},
+        )
+
+    class FakeSklearnModel:
+        def __init__(self, prediction: int, probability: float) -> None:
+            self.prediction = prediction
+            self.probability = probability
+
+        def predict(self, frame):
+            return np.array([self.prediction] * len(frame))
+
+        def predict_proba(self, frame):
+            return np.array([[1 - self.probability, self.probability]] * len(frame))
+
+    def load_fake_model(uri: str):
+        if uri == "models:/TumorRiskClassifier@candidate":
+            return FakeSklearnModel(prediction=0, probability=0.2)
+        return FakeSklearnModel(prediction=1, probability=0.9)
+
+    monkeypatch.setenv("MODEL_URI", "models:/TumorRiskClassifier@champion")
+    monkeypatch.setattr(shadow_logger, "propagate", True)
+    monkeypatch.setattr(model_loader, "MlflowClient", FakeClient)
+    monkeypatch.setattr(model_loader.Model, "load", lambda uri: FakeMlflowModel())
+    monkeypatch.setattr(model_loader.mlflow.sklearn, "load_model", load_fake_model)
+    caplog.set_level(logging.INFO, logger=shadow_logger.name)
+
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/predict",
+            json=sample,
+            headers={"X-Request-ID": "shadow-request-123"},
+        )
+        metrics_response = test_client.get("/metrics")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["model_version"] == "champion"
+    assert body["prediction"] == 1
+    assert body["malignant_probability"] == 0.9
+    assert "candidate_prediction" not in body
+
+    shadow_records = [
+        record for record in caplog.records if record.name == shadow_logger.name
+    ]
+    shadow_event = json.loads(shadow_records[-1].message)
+    assert shadow_event["request_id"] == "shadow-request-123"
+    assert shadow_event["champion_model_version"] == "champion"
+    assert shadow_event["candidate_model_version"] == "candidate"
+    assert shadow_event["champion_prediction"] == 1
+    assert shadow_event["candidate_prediction"] == 0
+    assert shadow_event["disagreement"] is True
+    assert shadow_event["probability_delta"] == pytest.approx(0.7)
+    assert "model_shadow_disagreements_total" in metrics_response.text
+    assert "model_shadow_probability_delta" in metrics_response.text
+
+
+def test_candidate_shadow_failure_does_not_break_predict(
+    monkeypatch: pytest.MonkeyPatch,
+    sample: dict[str, dict[str, float]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    features = list(sample["features"])
+
+    class FakeClient:
+        def get_model_version_by_alias(self, name: str, alias: str):
+            if alias == "candidate":
+                raise RuntimeError("candidate registry is unavailable")
+            return SimpleNamespace(version="10", run_id="run-champion")
+
+        def get_run(self, run_id: str):
+            return SimpleNamespace(
+                info=SimpleNamespace(start_time=1782396968225),
+                data=SimpleNamespace(
+                    params={"model_type": "LogisticRegression"},
+                    metrics={
+                        "accuracy": 0.98,
+                        "precision": 0.97,
+                        "recall": 0.96,
+                        "roc_auc": 0.99,
+                    },
+                ),
+            )
+
+    class FakeSignatureInput:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class FakeMlflowModel:
+        metadata = {"algorithm": "LogisticRegression"}
+        signature = SimpleNamespace(
+            inputs=SimpleNamespace(
+                inputs=[FakeSignatureInput(feature) for feature in features]
+            ),
+            to_dict=lambda: {"inputs": "[]", "outputs": "[]", "params": None},
+        )
+
+    class FakeSklearnModel:
+        def predict(self, frame):
+            return np.ones(len(frame), dtype=int)
+
+        def predict_proba(self, frame):
+            return np.array([[0.1, 0.9]] * len(frame))
+
+    monkeypatch.setenv("MODEL_URI", "models:/TumorRiskClassifier@champion")
+    monkeypatch.setattr(shadow_logger, "propagate", True)
+    monkeypatch.setattr(model_loader, "MlflowClient", FakeClient)
+    monkeypatch.setattr(model_loader.Model, "load", lambda uri: FakeMlflowModel())
+    monkeypatch.setattr(
+        model_loader.mlflow.sklearn,
+        "load_model",
+        lambda uri: FakeSklearnModel(),
+    )
+    caplog.set_level(logging.INFO, logger=shadow_logger.name)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/predict", json=sample)
+
+    assert response.status_code == 200
+    assert response.json()["prediction"] == 1
+    shadow_records = [
+        record for record in caplog.records if record.name == shadow_logger.name
+    ]
+    shadow_event = json.loads(shadow_records[-1].message)
+    assert shadow_event["candidate_prediction"] is None
+    assert shadow_event["disagreement"] is None
+    assert "candidate registry is unavailable" in shadow_event["candidate_error"]

@@ -64,6 +64,7 @@ services:
     environment:
       MODEL_VERSION: ${MODEL_VERSION:-v1}
       MODEL_URI: ${MODEL_URI:-}
+      SHADOW_MODEL_URI: ${SHADOW_MODEL_URI:-}
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
     ports:
       - "8000:8000"

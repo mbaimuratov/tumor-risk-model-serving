@@ -32,6 +32,16 @@ predictions_by_class_total = Counter(
     "Total individual predictions by class.",
     ("model_version", "prediction_class"),
 )
+model_shadow_disagreements_total = Counter(
+    "model_shadow_disagreements_total",
+    "Total shadow predictions where champion and candidate classes disagree.",
+    ("champion_model_version", "candidate_model_version"),
+)
+model_shadow_probability_delta = Histogram(
+    "model_shadow_probability_delta",
+    "Absolute probability delta between champion and candidate shadow predictions.",
+    ("champion_model_version", "candidate_model_version"),
+)
 
 
 def register_model_info(bundle: ModelBundle) -> None:
@@ -72,4 +82,22 @@ def record_prediction_metrics(
         predictions_by_class_total.labels(
             model_version=version,
             prediction_class=str(predicted_class),
+        ).inc()
+
+
+def record_shadow_metrics(
+    *,
+    champion_model_version: str,
+    candidate_model_version: str,
+    disagreement: bool,
+    probability_delta: float,
+) -> None:
+    model_shadow_probability_delta.labels(
+        champion_model_version=champion_model_version,
+        candidate_model_version=candidate_model_version,
+    ).observe(probability_delta)
+    if disagreement:
+        model_shadow_disagreements_total.labels(
+            champion_model_version=champion_model_version,
+            candidate_model_version=candidate_model_version,
         ).inc()

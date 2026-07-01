@@ -263,3 +263,12 @@ class ModelRegistry:
                     selected_version, models_root=self.models_root
                 )
             return self._models[selected_version]
+
+    def get_model_uri(self, model_uri: str) -> ModelBundle:
+        if not self.model_uri:
+            raise ModelLoadError("MLflow model URI loading is not configured.")
+
+        with self._lock:
+            if model_uri not in self._models:
+                self._models[model_uri] = load_mlflow_model(model_uri)
+            return self._models[model_uri]
