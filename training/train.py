@@ -427,6 +427,14 @@ def model_version_by_alias(alias: str):
         ) from exc
 
 
+def optional_model_version_by_alias(alias: str):
+    client = mlflow.tracking.MlflowClient()
+    try:
+        return client.get_model_version_by_alias(REGISTERED_MODEL_NAME, alias)
+    except Exception:
+        return None
+
+
 def model_version_run_metrics(model_version) -> dict[str, float]:
     if not model_version.run_id:
         raise RuntimeError(
@@ -517,16 +525,27 @@ def run_candidate_predict_smoke_test(version: str) -> None:
 
 def promote_candidate_to_champion() -> None:
     candidate_version = model_version_by_alias("candidate")
-    champion_version = model_version_by_alias("champion")
+    champion_version = optional_model_version_by_alias("champion")
 
     try:
         validate_model_artifacts(candidate_version.version)
-        validate_candidate_metrics(candidate_version, champion_version)
+        if champion_version is not None:
+            validate_candidate_metrics(candidate_version, champion_version)
+        else:
+            print(
+                f"No existing {REGISTERED_MODEL_NAME}@champion alias found; "
+                "skipping champion metric comparison for first promotion."
+            )
         run_candidate_predict_smoke_test(candidate_version.version)
     except Exception as exc:
+        champion_detail = (
+            f"on version {champion_version.version}"
+            if champion_version is not None
+            else "unset"
+        )
         print(
             f"Pre-deployment validation failed; kept {REGISTERED_MODEL_NAME}@champion "
-            f"on version {champion_version.version}. Reason: {exc}"
+            f"{champion_detail}. Reason: {exc}"
         )
         raise
 
